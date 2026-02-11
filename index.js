@@ -112,48 +112,6 @@ Style rules:
 - coaching, therapy, personal advice if requested in a general way.
 `;
 }
-const INTENT_PROMPT = `
-You are an intent classifier.
-
-Task:
-Determine whether the user's question requires real-time or up-to-date information from the internet.
-
-Answer strictly with one word:
-- REALTIME (if the question depends on current events, recent changes, live data, or "what is happening now")
-- GENERAL (if the question can be answered with general or historical knowledge)
-
-Do not explain.
-Do not add punctuation.
-`;
-const intentCheck = await openai.responses.create({
-  model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
-  input: [
-    { role: "system", content: INTENT_PROMPT },
-    { role: "user", content: text }
-  ]
-});
-
-const intent = intentCheck.output_text.trim();
-let webContext = "";
-
-if (intent === "REALTIME") {
-  const ws = await webSearch(text);
-  if (!ws?.error && ws.results?.length) {
-    webContext =
-      "\n\nREAL-TIME SOURCES:\n" +
-      ws.results
-        .slice(0, 5)
-        .map(r => `- ${r.title} (${r.url})`)
-        .join("\n");
-  } else {
-    webContext = "\n\nNote: Real-time information could not be verified.";
-  }
-}
-const input = [
-  { role: "system", content: systemPrompt() + webContext },
-  ...(user.memory || []),
-  { role: "user", content: text }
-];
 
 
 
@@ -484,6 +442,49 @@ app.post("/whatsapp", async (req, res) => {
     // ✅ DEFINE TEXT FIRST
     const text = (req.body.Body || "").trim();
     const from = req.body.From;
+    
+const INTENT_PROMPT = `
+You are an intent classifier.
+
+Task:
+Determine whether the user's question requires real-time or up-to-date information from the internet.
+
+Answer strictly with one word:
+- REALTIME (if the question depends on current events, recent changes, live data, or "what is happening now")
+- GENERAL (if the question can be answered with general or historical knowledge)
+
+Do not explain.
+Do not add punctuation.
+`;
+const intentCheck = await openai.responses.create({
+  model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+  input: [
+    { role: "system", content: INTENT_PROMPT },
+    { role: "user", content: text }
+  ]
+});
+
+const intent = intentCheck.output_text.trim();
+let webContext = "";
+
+if (intent === "REALTIME") {
+  const ws = await webSearch(text);
+  if (!ws?.error && ws.results?.length) {
+    webContext =
+      "\n\nREAL-TIME SOURCES:\n" +
+      ws.results
+        .slice(0, 5)
+        .map(r => `- ${r.title} (${r.url})`)
+        .join("\n");
+  } else {
+    webContext = "\n\nNote: Real-time information could not be verified.";
+  }
+}
+const input = [
+  { role: "system", content: systemPrompt() + webContext },
+  ...(user.memory || []),
+  { role: "user", content: text }
+];
 
     if (!text) return res.sendStatus(200);
 
