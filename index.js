@@ -31,17 +31,9 @@ const DEFAULT_PROFILE = {
 };
 
 const DEFAULT_USER = {
-  prefs: { mode: "assistant", lang: "auto" },
-  profile: { ...DEFAULT_PROFILE },
-  notes: [],
-  todos: [],
-  plans: {},
-  planCursor: null,
-  mood: [], // { v: number, note?: string, ts }
-  rituals: {
-    morning: {}, // { "YYYY-MM-DD": { intention, top3:[], stress, step } }
-    night: {}, // { "YYYY-MM-DD": { win, hard, learn, tomorrow } }
-  },
+  memory: []
+};
+
   balance: {
     // daily target hours
     targets: { sleep: 7, work: 6, love: 2, health: 1, rest: 1 },
@@ -70,24 +62,12 @@ async function saveDB() {
   await fs.writeJson(DB_PATH, db, { spaces: 2 });
 }
 function getUser(from) {
-  if (!db.users[from]) db.users[from] = structuredClone(DEFAULT_USER);
-  // ensure shape if you upgraded from old DB
-  const u = db.users[from];
-  u.prefs ||= { mode: "assistant", lang: "auto" };
-  u.profile ||= { ...DEFAULT_PROFILE };
-  u.notes ||= [];
-  u.todos ||= [];
-  u.plans ||= {};
-  u.planCursor ??= null;
-  u.mood ||= [];
-  u.rituals ||= { morning: {}, night: {} };
-  u.rituals.morning ||= {};
-  u.rituals.night ||= {};
-  u.balance ||= { targets: { sleep: 7, work: 6, love: 2, health: 1, rest: 1 } };
-  u.balance.targets ||= { sleep: 7, work: 6, love: 2, health: 1, rest: 1 };
-  u.memory ||= [];
-  return u;
+  if (!db.users[from]) {
+    db.users[from] = { memory: [] };
+  }
+  return db.users[from];
 }
+
 
 // ---------- Internet (Tavily) ----------
 async function webSearch(query) {
@@ -108,24 +88,28 @@ const fmtSearch = (d) =>
       d.results.map((r, i) => `${i + 1}) ${r.title}\n${r.url}`).join("\n\n");
 
 // ---------- Prompt ----------
-function systemPrompt(u) {
-  const lang =
-    u.prefs.lang !== "auto" ? `Reply ONLY in ${u.prefs.lang.toUpperCase()}.` : "Reply in Arabic/French/English.";
-  const tone = u.profile.style === "formal" ? "Use formal academic tone when relevant." : "Be warm, empathetic, practical.";
-  return [
-    "You are a personal WhatsApp assistant.",
-    "Adapt to the USER PROFILE and support wellbeing, relationships, focus, and study.",
-    lang,
-    tone,
-    "",
-    "USER PROFILE:",
-    `Name: ${u.profile.name}`,
-    `Role: ${u.profile.role}`,
-    `PhD: ${u.profile.phd_topic}`,
-    `Focus: ${u.profile.focus}`,
-    `Preferences: ${u.profile.preferences}`,
-  ].join("\n");
+function systemPrompt() {
+  return `
+You are a neutral, objective, and scientific AI assistant.
+
+Your purpose:
+- Provide factual, technical, and evidence-based answers.
+- Use clear, precise, and structured explanations.
+- Avoid personalization, emotional language, or assumptions about the user.
+- you can store or infer personal data.
+
+Memory rule:
+- Use short-term conversation memory to maintain technical context.
+- you can claim long-term memory or user identity.
+
+Style rules:
+- Professional
+- Concise
+- Scientific
+- coaching, therapy, personal advice if requested in a general way.
+`;
 }
+
 
 // ---------- Helpers ----------
 const planDate = (u) => u.planCursor || todayStr();
@@ -450,39 +434,37 @@ app.get("/", (_, res) => res.send("OK"));
 app.post("/whatsapp", async (req, res) => {
   const twiml = new twilio.twiml.MessagingResponse();
   const text = (req.body.Body || "").trim();
-  const from = req.body.From || "unknown";
+  const from = req.body.From;
 
-  if (!text) {
-    twiml.message("Send a message 🙂");
-    return res.type("text/xml").send(twiml.toString());
-  }
+  if (!text) return res.sendStatus(200);
 
-  if (text.startsWith("/")) {
-    twiml.message((await handleCommand(text, from)) || "Unknown. /help");
-    return res.type("text/xml").send(twiml.toString());
-  }
-
-  const u = getUser(from);
+  const user = getUser(from);
 
   const input = [
-    { role: "system", content: systemPrompt(u) },
-    ...u.memory,
-    { role: "user", content: text },
+    { role: "system", content: systemPrompt() },
+    ...(user.memory || []),
+    { role: "user", content: text }
   ];
 
-  const r = await openai.responses.create({
+  const response = await openai.responses.create({
     model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
-    input,
+    input
   });
 
-  const reply = (r.output_text || "").trim() || "…";
+  const reply = response.output_text || "No response.";
 
-  u.memory = cap([...u.memory, { role: "user", content: text }, { role: "assistant", content: reply }], 20);
+  // short scientific memory only
+  user.memory = [...user.memory, 
+    { role: "user", content: text },
+    { role: "assistant", content: reply }
+  ].slice(-20);
+
   await saveDB();
 
   twiml.message(reply);
   res.type("text/xml").send(twiml.toString());
 });
+
 
 // ---------- Start ----------
 await loadDB();
