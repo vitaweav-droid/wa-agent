@@ -491,40 +491,7 @@ const input = [
     const user = getUser(from);
 
     // --- Intent detection ---
-    const intentCheck = await openai.responses.create({
-      model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
-      input: [
-        { role: "system", content: INTENT_PROMPT },
-        { role: "user", content: text }
-      ]
-    });
-
-    const intent = (intentCheck.output_text || "").trim();
-
-    let webContext = "";
-
-    if (intent === "REALTIME") {
-      const ws = await webSearch(text);
-      if (ws?.results?.length) {
-        webContext =
-          "\n\nREAL-TIME SOURCES:\n" +
-          ws.results
-            .slice(0, 5)
-            .map(r => `- ${r.title} (${r.url})`)
-            .join("\n");
-      }
-    }
-
-    const input = [
-      { role: "system", content: systemPrompt() + webContext },
-      ...(user.memory || []),
-      { role: "user", content: text }
-    ];
-
-    const response = await openai.responses.create({
-      model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
-      input
-    });
+   
 
     const reply = response.output_text || "No response.";
 
