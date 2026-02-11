@@ -1,520 +1,232 @@
+// index.js (ESM) — General + Scientific WhatsApp Assistant with Minimal Memory + Optional Real-time Search
+// Works on Render + Twilio. No personal profile. Memory is only short-term context per user.
+// ENV required: OPENAI_API_KEY
+// ENV optional: OPENAI_MODEL (default gpt-4.1-mini), TAVILY_API_KEY, PORT (Render sets this)
+
 import "dotenv/config";
 import express from "express";
-import twilio from "twilio";
-import OpenAI from "openai";
 import fs from "fs-extra";
-import fetch from "node-fetch";
 import path from "path";
 import { fileURLToPath } from "url";
+import twilio from "twilio";
+import OpenAI from "openai";
 
-const app = express();
-app.use(express.urlencoded({ extended: false }));
+// -------------------- Config --------------------
+const PORT = Number(process.env.PORT || 5050);
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// ---------- DB ----------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DB_PATH = path.join(__dirname, "assistant_db.json");
 
-const DEFAULT_PROFILE = {
-  name: "Zakaria Oulqaid",
-  role: "Cybersecurity PhD student (dev profile)",
-  phd_topic:
-    "Security-by-Design for Smart Factories: Intelligent Threat Detection and Resilience for Industrial IoT and Critical Infrastructures",
-  focus:
-    "AI-based threat detection, zero trust, resilience for IIoT; datasets & simulation.",
-  languages: "Arabic/French/English",
-  style: "assistant", // assistant | formal
-  preferences:
-    "Help me with wellbeing, stress management, and my relationship with Hasnae. Be empathetic, practical, and concise.",
-};
+// Memory settings
+const MEMORY_TURNS = 10; // 10 turns = 20 messages (user+assistant)
+const MAX_MESSAGES = MEMORY_TURNS * 2;
 
-const DEFAULT_USER = {
-  memory: []
-};
+// -------------------- App + Clients --------------------
+const app = express();
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// Twilio sends x-www-form-urlencoded by default
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
-
+// -------------------- Minimal DB --------------------
 let db = { users: {} };
 
-const nowISO = () => new Date().toISOString();
-const newId = () => Math.random().toString(36).slice(2, 10);
-const todayStr = () => new Date().toISOString().slice(0, 10);
-const addDays = (d, n) => {
-  const x = new Date(d + "T00:00:00");
-  x.setDate(x.getDate() + n);
-  return x.toISOString().slice(0, 10);
-};
-const cap = (a, n) => a.slice(-n);
-
 async function loadDB() {
-  if (!(await fs.pathExists(DB_PATH))) await fs.writeJson(DB_PATH, db, { spaces: 2 });
-  db = await fs.readJson(DB_PATH);
-  db.users ||= {};
-}
-async function saveDB() {
-  await fs.writeJson(DB_PATH, db, { spaces: 2 });
-}
-function getUser(from) {
-  if (!db.users[from]) {
-    db.users[from] = { memory: [] };
+  try {
+    if (await fs.pathExists(DB_PATH)) {
+      const raw = await fs.readFile(DB_PATH, "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") db = parsed;
+      if (!db.users) db.users = {};
+    }
+  } catch {
+    db = { users: {} };
   }
+}
+
+async function saveDB() {
+  // Note: Render free filesystem can reset on redeploy/restart.
+  // For persistent memory use a DB (Postgres/Supabase) or Render Disk.
+  await fs.writeFile(DB_PATH, JSON.stringify(db, null, 2), "utf8");
+}
+
+function getUser(from) {
+  if (!db.users[from]) db.users[from] = { memory: [] };
+  if (!Array.isArray(db.users[from].memory)) db.users[from].memory = [];
   return db.users[from];
 }
 
-
-// ---------- Internet (Tavily) ----------
-async function webSearch(query) {
-  if (!process.env.TAVILY_API_KEY) return { error: "Missing TAVILY_API_KEY" };
-  const r = await fetch("https://api.tavily.com/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.TAVILY_API_KEY}` },
-    body: JSON.stringify({ query, max_results: 5, include_answer: true }),
-  });
-  return r.json();
+function cap(arr, n) {
+  return arr.length <= n ? arr : arr.slice(arr.length - n);
 }
-const fmtSearch = (d) =>
-  d?.error
-    ? `❌ ${d.error}`
-    : !d?.results?.length
-    ? "ما لقيتش نتائج."
-    : `${d.answer ? `🧠 ${d.answer}\n\n` : ""}🔗 Links:\n` +
-      d.results.map((r, i) => `${i + 1}) ${r.title}\n${r.url}`).join("\n\n");
 
-// ---------- Prompt ----------
+// -------------------- Prompts --------------------
 function systemPrompt() {
-    const today = new Date().toISOString().slice(0, 10);
-  return `
-
-  
-Today's date is: ${today} (provided by the server).
-
-If the user asks about "today" or "latest", use real-time web search if available; otherwise say you cannot verify in real time.
-Be precise, no invented dates.
-
-You are a neutral, objective, and scientific AI assistant.
-
-Your purpose:
-- Provide factual, technical, and evidence-based answers.
-- Use clear, precise, and structured explanations.
-- Avoid personalization, emotional language, or assumptions about the user.
-- you can store or infer personal data.
-
-Memory rule:
-- Use short-term conversation memory to maintain technical context.
-- you can claim long-term memory or user identity.
-
-Style rules:
-- Professional
-- Concise
-- Scientific
-- coaching, therapy, personal advice if requested in a general way.
-`;
-}
-
-
-
-// ---------- Helpers ----------
-const planDate = (u) => u.planCursor || todayStr();
-const planList = (u, d) => (u.plans[d] ||= []);
-const showPlan = (u, d) =>
-  planList(u, d).length
-    ? `📅 ${d}\n` + planList(u, d).map((p) => `${p.done ? "✅" : "⬜"} ${p.id} — ${p.text}`).join("\n")
-    : `📅 ${d}\n(empty)`;
-
-function help() {
+  const today = new Date().toISOString().slice(0, 10);
   return [
-    "🤖 Commands:",
-    "/help",
-    "/profile | /profile set key=value",
-    "/checkin | /stress | /breath",
-    "/couple <situation>",
-    "/focus 45",
-    "/plan | /plan add <task> | /plan done <id> | /plan tomorrow",
-    "/note <text> | /notes",
-    "/todo <text> | /list",
-    "/morning | /morning set ...",
-    "/night | /night set ...",
-    "/balance | /balance set sleep=7 work=6 love=2 health=1 rest=1",
-    "/search <q> | /verify <claim>",
+    "You are a neutral, objective, and scientific AI assistant.",
+    `Today's date is ${today} (provided by the server).`,
+    "",
+    "Rules:",
+    "- Do NOT assume user identity or personal details.",
+    "- Do NOT invent dates like 'as of today' unless the server date is given or you cite web sources.",
+    "- Be precise, structured, and evidence-based.",
+    "- If the question depends on up-to-date information, use provided real-time sources if available; otherwise say you cannot verify in real time.",
+    "",
+    "Memory rule:",
+    "- You may use short-term conversation memory only to preserve technical context.",
+    "- Do not store or infer sensitive personal information.",
   ].join("\n");
 }
 
-// ---------- Rituals: Morning / Night ----------
-function showMorning(u, date = todayStr()) {
-  const m = u.rituals.morning[date];
+const INTENT_PROMPT = [
+  "You are an intent classifier.",
+  "",
+  "Decide if the user's message requires real-time internet information to answer correctly.",
+  "Answer with exactly one word:",
+  "- REALTIME (needs current events, latest updates, live data, prices, recent changes, 'what's happening now')",
+  "- GENERAL (can be answered with stable/established knowledge)",
+  "",
+  "No explanations. No punctuation.",
+].join("\n");
 
-  const header = [`☀️ Morning + Balance (${date})`];
+// -------------------- Real-time Web Search (Tavily) --------------------
+async function webSearch(query) {
+  if (!TAVILY_API_KEY) return { error: "NO_TAVILY_KEY", results: [] };
 
-  const saved = m
-    ? [
-        `Intention: ${m.intention || "-"}`,
-        `Top3: ${(m.top3 || []).join(", ") || "-"}`,
-        `Stress: ${m.stress ?? "-"}`,
-        `First step: ${m.step || "-"}`,
-      ].join("\n")
-    : [
-        "1) نية اليوم (intention)؟",
-        "2) أهم 3 حاجات اليوم؟",
-        "3) مستوى الستريس (0–10)؟",
-        "4) خطوة صغيرة دابا؟",
-        "",
-        "Save example:",
-        "/morning set intention=Peace top3=thesis,gym,message_hasnae stress=5 step=Start_10min_thesis",
-      ].join("\n");
+  try {
+    const resp = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: TAVILY_API_KEY,
+        query,
+        search_depth: "basic",
+        max_results: 5,
+        include_answer: false,
+        include_raw_content: false,
+      }),
+    });
 
-  return [
-    header.join("\n"),
-    saved,
-    "",
-    showBalanceSchedule(u, date),
-    "",
-    "Auto plan: /morning auto",
-  ].join("\n");
+    if (!resp.ok) return { error: `TAVILY_HTTP_${resp.status}`, results: [] };
+
+    const data = await resp.json();
+    const results = Array.isArray(data.results) ? data.results : [];
+    return {
+      error: null,
+      results: results.map((r) => ({
+        title: r.title || "Untitled",
+        url: r.url || "",
+        content: (r.content || "").slice(0, 500),
+      })),
+    };
+  } catch (e) {
+    return { error: "TAVILY_FETCH_FAILED", results: [] };
+  }
 }
 
-function showNight(u, date = todayStr()) {
-  const n = u.rituals.night[date];
-  if (!n) {
-    return [
-      `🌙 Night (${date})`,
-      "1) شنو ربحتي/داز مزيان اليوم؟ (win)",
-      "2) شنو كان صعيب؟ (hard)",
-      "3) شنو تعلمتي؟ (learn)",
-      "4) شنو أول حاجة غدا؟ (tomorrow)",
-      "",
-      "Save example:",
-      "/night set win=Finished section hard=Stress learn=Take breaks tomorrow=Write outline",
-    ].join("\n");
-  }
-  return [
-    `🌙 Night (${date})`,
-    `Win: ${n.win || "-"}`,
-    `Hard: ${n.hard || "-"}`,
-    `Learn: ${n.learn || "-"}`,
-    `Tomorrow: ${n.tomorrow || "-"}`,
-  ].join("\n");
+function formatSources(results) {
+  const clean = (results || []).filter((r) => r.url);
+  if (!clean.length) return "";
+
+  const lines = clean.slice(0, 5).map((r) => `- ${r.title} (${r.url})`);
+  return "\n\nREAL-TIME SOURCES:\n" + lines.join("\n");
 }
 
-function parseKeyValues(raw) {
-  // supports: key=value key2=value2 ...
-  // and top3=a,b,c
-  const parts = raw.split(" ").filter(Boolean);
-  const out = {};
-  for (const p of parts) {
-    const idx = p.indexOf("=");
-    if (idx === -1) continue;
-    const k = p.slice(0, idx).trim();
-    const v = p.slice(idx + 1).trim();
-    if (!k) continue;
-    out[k] = v;
-  }
-  return out;
+// -------------------- Routes --------------------
+app.get("/", (_req, res) => res.status(200).send("OK"));
+app.get("/health", (_req, res) =>
+  res.status(200).json({ ok: true, model: OPENAI_MODEL, has_tavily: !!TAVILY_API_KEY })
+);
+
+// Optional: reset memory for the current user
+function isResetCommand(text) {
+  return /^\/reset\b/i.test(text);
 }
-
-// ---------- Balance ----------
-function showBalance(u) {
-  const t = u.balance.targets;
-  return [
-    "⚖️ Balance targets (hours/day):",
-    `sleep=${t.sleep}, work=${t.work}, love=${t.love}, health=${t.health}, rest=${t.rest}`,
-    "",
-    "Tip: دير plan اليوم ووزّع وقتك عليها.",
-    "Edit example: /balance set sleep=7 work=6 love=2 health=1 rest=1",
-  ].join("\n");
-}
-function showBalanceSchedule(u, date = todayStr()) {
-  const t = u.balance.targets;
-  const plan = planList(u, date);
-  const tasks = plan.filter(x => !x.done).map(x => x.text);
-
-  // Simple schedule proposal (not strict times, just blocks)
-  const blocks = [
-    `🛌 Sleep: ${t.sleep}h`,
-    `💼 Work/Thesis: ${t.work}h`,
-    `❤️ Love/Relationship: ${t.love}h`,
-    `🏃 Health: ${t.health}h`,
-    `🧘 Rest: ${t.rest}h`,
-  ];
-
-  const tasksLine = tasks.length ? `📌 Today tasks (from /plan): ${tasks.slice(0,5).join(" | ")}` : "📌 No tasks yet. Add with /plan add ...";
-
-  return [
-    `⚖️ Balance schedule (${date})`,
-    blocks.join("\n"),
-    "",
-    tasksLine,
-    "",
-    "Tip: دير 2 blocs ديال thesis (مثلاً 2×90min) وخلّي وقت للحياة ❤️",
-  ].join("\n");
-}
-
-
-function setBalance(u, raw) {
-  const kv = parseKeyValues(raw);
-  const keys = ["sleep", "work", "love", "health", "rest"];
-  let changed = 0;
-
-  for (const k of keys) {
-    if (kv[k] !== undefined) {
-      const num = Number(kv[k]);
-      if (!Number.isFinite(num) || num < 0 || num > 24) continue;
-      u.balance.targets[k] = num;
-      changed++;
-    }
-  }
-  return changed ? "✅ Balance updated." : "Use: /balance set sleep=7 work=6 love=2 health=1 rest=1";
-}
-
-// ---------- Commands ----------
-async function handleCommand(text, from) {
-  const u = getUser(from);
-  const low = text.toLowerCase();
-
-  // help/profile
-  if (low === "/help") return help();
-  if (low === "/profile")
-    return Object.entries(u.profile)
-      .map(([k, v]) => `${k}: ${v}`)
-      .join("\n");
-  if (low.startsWith("/profile set ")) {
-    const rest = text.replace("/profile set ", "");
-    const idx = rest.indexOf("=");
-    if (idx === -1) return "Use: /profile set key=value";
-    const key = rest.slice(0, idx).trim();
-    const value = rest.slice(idx + 1).trim();
-    if (!key || !value) return "Use: /profile set key=value";
-    u.profile[key] = value;
-    await saveDB();
-    return "✅ Profile updated.";
-  }
-
-  // wellbeing
-  if (low === "/checkin") return "كيف داير دابا (0–10)؟ شنو السبب؟ شنو محتاج دابا؟ خطوة صغيرة؟";
-  if (low === "/stress") return "⏸️ Pause 30s → تنفّس → رتب فكرة وحدة → دير خطوة 2 دقايق.";
-  if (low === "/breath") return "😮‍💨 4-4-6: شهيق 4، حبس 4، زفير 6 ×5 مرات.";
-
-  // relationship
-  if (low.startsWith("/couple ")) {
-    const s = text.slice(8).trim();
-    return [
-      "💙 Couple coach (3 رسائل):",
-      `1) هادئة: "كنحس بالضغط شوية، وباغي نهضرو بهدوء باش نفهموك ونفهميني."`,
-      `2) رومانسية: "حسناء كنقدّرك بزاف، وبغيت نصلحوها بيناتنا بحب وهدوء."`,
-      `3) واضحة: "بغيت نتفقو على… باش ما يتعاودش نفس المشكل."`,
-      "",
-      `📌 Situation: ${s}`,
-      "بغيتك تجاوبني: شنو بغيتي منها بالضبط؟ وشنو الحاجة اللي كتحسها ناقصة دابا؟",
-    ].join("\n");
-  }
-
-  // focus
-  if (low.startsWith("/focus")) {
-    const m = Number(text.split(" ")[1] || 45);
-    const minutes = Number.isFinite(m) ? m : 45;
-    return `🎯 Focus ${minutes}min: هدف واحد، notifications off، break 5min، ومن بعد راجع شنو درتي.`;
-  }
-
-  // plan
-  if (low === "/plan") return showPlan(u, planDate(u));
-  if (low === "/plan tomorrow") {
-    u.planCursor = addDays(todayStr(), 1);
-    await saveDB();
-    return showPlan(u, u.planCursor);
-  }
-  if (low.startsWith("/plan add ")) {
-    const t = text.slice(10).trim();
-    if (!t) return "Use: /plan add <task>";
-    const d = planDate(u);
-    planList(u, d).push({ id: newId(), text: t, done: false, ts: nowISO() });
-    await saveDB();
-    return `✅ Added to plan (${d}).`;
-  }
-  if (low.startsWith("/plan done ")) {
-    const id = text.slice(11).trim();
-    const it = planList(u, planDate(u)).find((x) => x.id === id);
-    if (!it) return "Not found. Use /plan to see ids.";
-    it.done = true;
-    await saveDB();
-    return "✅ Done.";
-  }
-
-  // notes / todos
-  if (low.startsWith("/note ")) {
-    const t = text.slice(6).trim();
-    if (!t) return "Use: /note <text>";
-    u.notes.push({ id: newId(), text: t, ts: nowISO() });
-    await saveDB();
-    return "📝 Saved.";
-  }
-  if (low === "/notes") return u.notes.map((n) => `• ${n.id} ${n.text}`).join("\n") || "No notes.";
-  if (low.startsWith("/todo ")) {
-    const t = text.slice(6).trim();
-    if (!t) return "Use: /todo <text>";
-    u.todos.push({ id: newId(), text: t, done: false, ts: nowISO() });
-    await saveDB();
-    return "✅ Todo added.";
-  }
-  if (low === "/list") return u.todos.map((t) => `${t.done ? "✅" : "⬜"} ${t.id} ${t.text}`).join("\n") || "No todos.";
-
-  // morning / night
-  if (low === "/morning") return showMorning(u, todayStr());
-if (low === "/morning auto") {
-  const d = todayStr();
-  // Build a simple plan based on balance targets + top3
-  const t = u.balance.targets;
-  const m = u.rituals.morning[d] || {};
-  const top3 = Array.isArray(m.top3) ? m.top3 : [];
-
-  // reset today's plan
-  u.plans[d] = [];
-
-  // Core blocks
-  u.plans[d].push({ id: newId(), text: `Thesis/Work block 1 (≈${Math.max(1, Math.round(t.work/2))}h)`, done: false, ts: nowISO() });
-  u.plans[d].push({ id: newId(), text: `Thesis/Work block 2 (≈${Math.max(1, Math.round(t.work/2))}h)`, done: false, ts: nowISO() });
-  u.plans[d].push({ id: newId(), text: `Health (≈${t.health}h): walk/gym/stretch`, done: false, ts: nowISO() });
-  u.plans[d].push({ id: newId(), text: `Love/Connection (≈${t.love}h): message/call quality time`, done: false, ts: nowISO() });
-  u.plans[d].push({ id: newId(), text: `Rest (≈${t.rest}h): calm time, no phone`, done: false, ts: nowISO() });
-
-  // Add Top3 as explicit tasks
-  for (const x of top3.slice(0, 3)) {
-    u.plans[d].push({ id: newId(), text: `Top3: ${x}`, done: false, ts: nowISO() });
-  }
-
-  await saveDB();
-  return "✅ Built today's plan from Balance + Morning. Send /plan to see it.";
-}
-
-  if (low.startsWith("/morning set ")) {
-    const raw = text.slice("/morning set ".length).trim();
-    const kv = parseKeyValues(raw);
-    const d = todayStr();
-    u.rituals.morning[d] ||= {};
-    if (kv.intention) u.rituals.morning[d].intention = kv.intention.replace(/_/g, " ");
-    if (kv.top3) u.rituals.morning[d].top3 = kv.top3.split(",").map((x) => x.trim()).filter(Boolean);
-    if (kv.stress !== undefined) {
-      const s = Number(kv.stress);
-      if (Number.isFinite(s)) u.rituals.morning[d].stress = s;
-    }
-    if (kv.step) u.rituals.morning[d].step = kv.step.replace(/_/g, " ");
-    await saveDB();
-    return showMorning(u, d);
-  }
-
-  if (low === "/night") return showNight(u, todayStr());
-  if (low.startsWith("/night set ")) {
-    const raw = text.slice("/night set ".length).trim();
-    const kv = parseKeyValues(raw);
-    const d = todayStr();
-    u.rituals.night[d] ||= {};
-    if (kv.win) u.rituals.night[d].win = kv.win.replace(/_/g, " ");
-    if (kv.hard) u.rituals.night[d].hard = kv.hard.replace(/_/g, " ");
-    if (kv.learn) u.rituals.night[d].learn = kv.learn.replace(/_/g, " ");
-    if (kv.tomorrow) u.rituals.night[d].tomorrow = kv.tomorrow.replace(/_/g, " ");
-    await saveDB();
-    return showNight(u, d);
-  }
-
-  // balance
-  if (low === "/balance") return showBalance(u);
-  if (low.startsWith("/balance set ")) {
-    const raw = text.slice("/balance set ".length).trim();
-    const msg = setBalance(u, raw);
-    await saveDB();
-    return msg + "\n\n" + showBalance(u);
-  }
-
-  // internet
-  if (low.startsWith("/search ")) return fmtSearch(await webSearch(text.slice(8).trim()));
-  if (low.startsWith("/verify ")) return fmtSearch(await webSearch(("verify " + text.slice(8)).trim()));
-
-  return null;
-}
-
-// ---------- Routes ----------
-app.get("/", (_, res) => res.send("OK"));
 
 app.post("/whatsapp", async (req, res) => {
+  const twiml = new twilio.twiml.MessagingResponse();
+
   try {
-    const twiml = new twilio.twiml.MessagingResponse();
+    const body = req.body || {};
+    const text = (body.Body || "").toString().trim();
+    const from = (body.From || "").toString().trim() || "unknown";
 
-    // ✅ DEFINE TEXT FIRST
-    const text = (req.body.Body || "").trim();
-    const from = req.body.From;
-    
-const INTENT_PROMPT = `
-You are an intent classifier.
-
-Task:
-Determine whether the user's question requires real-time or up-to-date information from the internet.
-
-Answer strictly with one word:
-- REALTIME (if the question depends on current events, recent changes, live data, or "what is happening now")
-- GENERAL (if the question can be answered with general or historical knowledge)
-
-Do not explain.
-Do not add punctuation.
-`;
-const intentCheck = await openai.responses.create({
-  model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
-  input: [
-    { role: "system", content: INTENT_PROMPT },
-    { role: "user", content: text }
-  ]
-});
-
-const intent = intentCheck.output_text.trim();
-let webContext = "";
-
-if (intent === "REALTIME") {
-  const ws = await webSearch(text);
-  if (!ws?.error && ws.results?.length) {
-    webContext =
-      "\n\nREAL-TIME SOURCES:\n" +
-      ws.results
-        .slice(0, 5)
-        .map(r => `- ${r.title} (${r.url})`)
-        .join("\n");
-  } else {
-    webContext = "\n\nNote: Real-time information could not be verified.";
-  }
-}
-const input = [
-  { role: "system", content: systemPrompt() + webContext },
-  ...(user.memory || []),
-  { role: "user", content: text }
-];
-
+    // Ignore empty pings
     if (!text) return res.sendStatus(200);
 
     const user = getUser(from);
 
-    // --- Intent detection ---
-   
+    // Allow user to reset their own short-term memory
+    if (isResetCommand(text)) {
+      user.memory = [];
+      await saveDB();
+      twiml.message("✅ Context reset. (Short-term memory cleared)");
+      return res.type("text/xml").send(twiml.toString());
+    }
 
-    const reply = response.output_text || "No response.";
+    // 1) Decide if we need real-time info (semantic intent)
+    const intentResp = await openai.responses.create({
+      model: OPENAI_MODEL,
+      input: [
+        { role: "system", content: INTENT_PROMPT },
+        { role: "user", content: text },
+      ],
+    });
 
-    // ✅ minimal general memory
-    user.memory = [
+    const intent = (intentResp.output_text || "").trim();
+
+    // 2) If REALTIME, fetch web sources (optional)
+    let webContext = "";
+    if (intent === "REALTIME") {
+      const ws = await webSearch(text);
+      if (!ws.error && ws.results.length) {
+        webContext = formatSources(ws.results);
+      } else {
+        webContext =
+          "\n\nNote: Real-time web search is not available or returned no results, so I cannot fully verify up-to-date details.";
+      }
+    }
+
+    // 3) Build final assistant input with minimal memory
+    const input = [
+      { role: "system", content: systemPrompt() + webContext },
       ...(user.memory || []),
       { role: "user", content: text },
-      { role: "assistant", content: reply }
-    ].slice(-20);
+    ];
+
+    const finalResp = await openai.responses.create({
+      model: OPENAI_MODEL,
+      input,
+    });
+
+    const reply = (finalResp.output_text || "").trim() || "…";
+
+    // 4) Save minimal memory (context only)
+    user.memory = cap(
+      [
+        ...(user.memory || []),
+        { role: "user", content: text },
+        { role: "assistant", content: reply },
+      ],
+      MAX_MESSAGES
+    );
 
     await saveDB();
 
     twiml.message(reply);
-    res.type("text/xml").send(twiml.toString());
-
+    return res.type("text/xml").send(twiml.toString());
   } catch (err) {
-    console.error(err);
-    res.sendStatus(200);
+    console.error("WHATSAPP ERROR:", err);
+    // Always return 200/TwiML to reduce Twilio retry storms
+    return res.type("text/xml").send(twiml.toString());
   }
 });
 
-
-
-// ---------- Start ----------
+// -------------------- Start --------------------
 await loadDB();
-app.listen(process.env.PORT || 3000, () => console.log("✅ Assistant ready"));
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
