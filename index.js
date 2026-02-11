@@ -34,12 +34,7 @@ const DEFAULT_USER = {
   memory: []
 };
 
-  balance: {
-    // daily target hours
-    targets: { sleep: 7, work: 6, love: 2, health: 1, rest: 1 },
-  },
-  memory: [],
-};
+
 
 let db = { users: {} };
 
