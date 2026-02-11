@@ -478,38 +478,73 @@ if (low === "/morning auto") {
 app.get("/", (_, res) => res.send("OK"));
 
 app.post("/whatsapp", async (req, res) => {
-  const twiml = new twilio.twiml.MessagingResponse();
-  const text = (req.body.Body || "").trim();
-  const from = req.body.From;
+  try {
+    const twiml = new twilio.twiml.MessagingResponse();
 
-  if (!text) return res.sendStatus(200);
+    // ✅ DEFINE TEXT FIRST
+    const text = (req.body.Body || "").trim();
+    const from = req.body.From;
 
-  const user = getUser(from);
+    if (!text) return res.sendStatus(200);
 
-  const input = [
-    { role: "system", content: systemPrompt() },
-    ...(user.memory || []),
-    { role: "user", content: text }
-  ];
+    const user = getUser(from);
 
-  const response = await openai.responses.create({
-    model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
-    input
-  });
+    // --- Intent detection ---
+    const intentCheck = await openai.responses.create({
+      model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+      input: [
+        { role: "system", content: INTENT_PROMPT },
+        { role: "user", content: text }
+      ]
+    });
 
-  const reply = response.output_text || "No response.";
+    const intent = (intentCheck.output_text || "").trim();
 
-  // short scientific memory only
-  user.memory = [...user.memory, 
-    { role: "user", content: text },
-    { role: "assistant", content: reply }
-  ].slice(-20);
+    let webContext = "";
 
-  await saveDB();
+    if (intent === "REALTIME") {
+      const ws = await webSearch(text);
+      if (ws?.results?.length) {
+        webContext =
+          "\n\nREAL-TIME SOURCES:\n" +
+          ws.results
+            .slice(0, 5)
+            .map(r => `- ${r.title} (${r.url})`)
+            .join("\n");
+      }
+    }
 
-  twiml.message(reply);
-  res.type("text/xml").send(twiml.toString());
+    const input = [
+      { role: "system", content: systemPrompt() + webContext },
+      ...(user.memory || []),
+      { role: "user", content: text }
+    ];
+
+    const response = await openai.responses.create({
+      model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+      input
+    });
+
+    const reply = response.output_text || "No response.";
+
+    // ✅ minimal general memory
+    user.memory = [
+      ...(user.memory || []),
+      { role: "user", content: text },
+      { role: "assistant", content: reply }
+    ].slice(-20);
+
+    await saveDB();
+
+    twiml.message(reply);
+    res.type("text/xml").send(twiml.toString());
+
+  } catch (err) {
+    console.error(err);
+    res.sendStatus(200);
+  }
 });
+
 
 
 // ---------- Start ----------
